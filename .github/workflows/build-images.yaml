@@ -4,7 +4,7 @@ on: # build on main branch OR when a PR is labeled with `CICD:build-images`
     types: [labeled, opened, synchronize, reopened]
   push:
     branches:
-      - main
+      # - main - disable main branch image building since we assume it's already being built from the auto branch before merging (due to how bors works), possibly reactivate this if we move away from bors
       - auto
       - canary
       - devnet
@@ -18,10 +18,18 @@ concurrency:
 env:
   GCP_DOCKER_ARTIFACT_REPO: ${{ secrets.GCP_DOCKER_ARTIFACT_REPO }}
   AWS_ECR_ACCOUNT_NUM: ${{ secrets.ENV_ECR_AWS_ACCOUNT_NUM }}
+  # In case of pull_request build the images with the head of the PR branch instead of the prospective merge result.
+  # While this may lead to images which are built without the latest base branch commits, this leads to more predictable build images
+  # which have the same commit sha1 as the developers local git.
+  # also safety-wise the merge queue (bors/kodiak or whatever we use) will retest the PR branch merged with the base branch anyways.
+  # In case of push events, this hack is a noop as we default to `github.sha`.
+  # For more info also see https://github.com/actions/checkout#checkout-pull-request-head-commit-instead-of-merge-commit
+  GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 permissions:
   contents: read
   id-token: write #required for GCP Workload Identity federation which we use to login into Google Artifact Registry
+  issues: write
 
 jobs:
   rust-images:
@@ -34,6 +42,8 @@ jobs:
     runs-on: high-perf-docker
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ env.GIT_SHA }}
 
       - uses: ./.github/actions/gar-auth
         with:
@@ -59,12 +69,24 @@ jobs:
     needs: rust-images
     uses: ./.github/workflows/sdk-integration-test.yaml
     secrets: inherit
+    with:
+      GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  forge-e2e-test:
+    needs: rust-images
+    # if: ${{ secrets.FORGE_ENABLED == 'true' }}
+    uses: ./.github/workflows/run-forge.yaml
+    secrets: inherit
+    with:
+      GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   community-platform:
     if: ${{ github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'CICD:build-images') }}
     runs-on: high-perf-docker
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: ${{ env.GIT_SHA }}
 
       - uses: ./.github/actions/gar-auth
         with:
@@ -81,6 +103,8 @@ jobs:
       - uses: ./.github/actions/docker-buildx-setup
 
       - name: Build and Push Community Platform image
+        env:
+          GIT_BRANCH: ${{ github.head_ref }}
         run: |
           cd ecosystem/platform/server
-          GIT_SHA1=${GITHUB_SHA} docker buildx bake --progress=plain --push -f ./docker-bake.hcl
+          docker buildx bake --progress=plain --push -f ./docker-bake.hcl
